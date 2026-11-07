@@ -1,0 +1,101 @@
+# CR iOS build POC-A — unsigned, no secrets, no CR source, no EAS builds.
+# Place at .github/workflows/ios-poc-unsigned.yml in a PUBLIC scratch repo
+# (public-repo standard runners are free). Run manually (workflow_dispatch).
+# Measures: Xcode/macOS image, Expo SDK 55 iOS Release simulator build time,
+# unsigned device-archive time, and a simulator launch screenshot at default
+# and maximum Dynamic Type.
+name: ios-poc-unsigned
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  expo-ios-unsigned:
+    runs-on: macos-15
+    timeout-minutes: 75
+    env:
+      APP: iospoc
+      BUNDLE_ID: com.example.iospoc
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Select newest installed Xcode 26 and record toolchain
+        run: |
+          X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$X" ]; then echo "No Xcode 26 on this image"; ls /Applications | grep -i xcode; exit 1; fi
+          sudo xcode-select -s "$X"
+          {
+            echo "## Toolchain"
+            echo '```'
+            sw_vers
+            xcodebuild -version
+            node -v
+            pod --version
+            sysctl -n machdep.cpu.brand_string
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create sample Expo app (SDK 55 blank template, no CR code)
+        run: |
+          npx --yes create-expo-app@latest "$APP" --template blank-typescript@sdk-55 --no-install
+          cd "$APP"
+          node -e "const f='app.json';const j=require('./'+f);j.expo.ios=Object.assign({},j.expo.ios,{bundleIdentifier:process.env.BUNDLE_ID});require('fs').writeFileSync(f,JSON.stringify(j,null,2))"
+          npm install
+
+      - name: Prebuild iOS project and install pods
+        working-directory: ${{ env.APP }}
+        run: |
+          START=$(date +%s)
+          CI=1 npx expo prebuild --platform ios --no-install
+          cd ios && pod install
+          echo "PREBUILD_AND_PODS_SECONDS=$(( $(date +%s) - START ))" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Release build for iOS Simulator (no signing)
+        working-directory: ${{ env.APP }}/ios
+        run: |
+          START=$(date +%s)
+          set -o pipefail
+          xcodebuild -workspace "$APP.xcworkspace" -scheme "$APP" \
+            -configuration Release -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build | tail -40
+          echo "SIM_RELEASE_BUILD_SECONDS=$(( $(date +%s) - START ))" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Unsigned device archive (timing only; not installable)
+        working-directory: ${{ env.APP }}/ios
+        run: |
+          START=$(date +%s)
+          set -o pipefail
+          xcodebuild -workspace "$APP.xcworkspace" -scheme "$APP" \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/"$APP".xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO archive | tail -40
+          echo "UNSIGNED_ARCHIVE_SECONDS=$(( $(date +%s) - START ))" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Simulator smoke - boot, install, launch, screenshots
+        working-directory: ${{ env.APP }}/ios
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys;d=json.load(sys.stdin)['devices'];print(next(x['udid'] for r,v in sorted(d.items(),reverse=True) if 'iOS' in r for x in v if x['name'].startswith('iPhone')))")
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          APPDIR=$(find build/Build/Products/Release-iphonesimulator -maxdepth 1 -name '*.app' | head -1)
+          xcrun simctl install "$UDID" "$APPDIR"
+          xcrun simctl launch "$UDID" "$BUNDLE_ID"
+          sleep 20
+          mkdir -p ../../shots
+          xcrun simctl io "$UDID" screenshot ../../shots/default.png
+          xcrun simctl ui "$UDID" content_size accessibility-extra-extra-extra-large
+          xcrun simctl terminate "$UDID" "$BUNDLE_ID" || true
+          xcrun simctl launch "$UDID" "$BUNDLE_ID"
+          sleep 15
+          xcrun simctl io "$UDID" screenshot ../../shots/max-dynamic-type.png
+          xcrun simctl spawn "$UDID" log show --last 2m --predicate "process == '$APP'" > ../../shots/app-log.txt || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-poc-evidence
+          path: shots/
+          retention-days: 14
